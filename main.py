@@ -1,8 +1,6 @@
 """
-Telegram Traducteur — Arménien → Français
-Tourne 24/7 sur Render.com (gratuit)
-- Déduplication par GUID + similarité de texte (Jaccard)
-- Filtrage de pertinence automatique via Claude AI ou scoring basique
+Telegram Traducteur — Armenien -> Francais
+Tourne sur GitHub Actions (gratuit)
 """
 import os
 import re
@@ -13,302 +11,177 @@ import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 
-# ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S'
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
 )
 log = logging.getLogger(__name__)
 
-# ── Config depuis variables d'environnement ────────────────────────────────
-BOT_TOKEN       = os.environ.get('BOT_TOKEN', '')
-RECIPIENTS      = os.environ.get('RECIPIENTS', '')
-CHANNELS        = os.environ.get('CHANNELS', '')
-MYMEMORY_EMAIL  = os.environ.get('MYMEMORY_EMAIL', '')
-CLAUDE_API_KEY  = os.environ.get('CLAUDE_API_KEY', '')   # optionnel — scoring IA
-INTERVAL        = int(os.environ.get('INTERVAL', '300'))
-MIN_SCORE       = int(os.environ.get('MIN_SCORE', '5'))          # score min /10
-SIMILARITY_THR  = float(os.environ.get('SIMILARITY_THR', '0.7')) # seuil doublon
-RUN_ONCE        = os.environ.get('RUN_ONCE', 'false').lower() == 'true'
+# ── Config ─────────────────────────────────────────────────────────────────
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
+RECIPIENTS     = os.environ.get("RECIPIENTS", "")
+CHANNELS       = os.environ.get("CHANNELS", "")
+MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL", "")
+INTERVAL       = int(os.environ.get("INTERVAL", "300"))
+RUN_ONCE       = os.environ.get("RUN_ONCE", "false").lower() == "true"
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN manquant !")
 if not RECIPIENTS:
-    raise ValueError("RECIPIENTS manquant (ex: 123456789,987654321)")
+    raise ValueError("RECIPIENTS manquant !")
 if not CHANNELS:
-    raise ValueError("CHANNELS manquant (ex: oragir_news,twentyfournews)")
+    raise ValueError("CHANNELS manquant !")
 
-recipient_ids = [r.strip() for r in RECIPIENTS.split(',') if r.strip()]
-channel_names = [c.strip() for c in CHANNELS.split(',') if c.strip()]
+recipient_ids = [r.strip() for r in RECIPIENTS.split(",") if r.strip()]
+channel_names = [c.strip() for c in CHANNELS.split(",") if c.strip()]
 
-log.info("=" * 55)
+log.info("=" * 50)
 log.info("  Telegram Traducteur AM->FR")
-log.info("=" * 55)
+log.info("=" * 50)
 log.info(f"Canaux        : {', '.join(channel_names)}")
 log.info(f"Destinataires : {len(recipient_ids)}")
 log.info(f"Intervalle    : {INTERVAL}s")
-log.info(f"Score min     : {MIN_SCORE}/10")
-log.info(f"Seuil doublon : {int(SIMILARITY_THR*100)}%")
-log.info(f"Scoring IA    : {'Claude (actif)' if CLAUDE_API_KEY else 'Basique (pas de cle Claude)'}")
+log.info(f"Mode          : {'GitHub Actions (cycle unique)' if RUN_ONCE else 'Continu'}")
 
 # ── Etat ───────────────────────────────────────────────────────────────────
-seen_guids  = set()
-seen_texts  = []   # historique textes pour dedup (max 200)
-first_run   = {ch: True for ch in channel_names}
-stats       = {
-    'fetched': 0, 'translated': 0, 'sent': 0,
-    'skipped_dup': 0, 'skipped_score': 0, 'errors': 0
-}
+seen_guids = set()
+first_run  = {ch: True for ch in channel_names}
+stats      = {"fetched": 0, "translated": 0, "sent": 0, "errors": 0}
 
-# ── HTTP helpers ───────────────────────────────────────────────────────────
-def http_get(url, timeout=15, extra_headers=None):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (compatible; TelegramTranslator/1.0)',
-        'Accept': '*/*',
-    }
-    if extra_headers:
-        headers.update(extra_headers)
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode('utf-8', errors='replace')
+# ── HTTP ───────────────────────────────────────────────────────────────────
+def http_get(url, timeout=15):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; TelegramTranslator/1.0)",
+        "Accept": "*/*",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="replace")
 
 def http_post_json(url, data, timeout=15, extra_headers=None):
-    headers = {'Content-Type': 'application/json', 'User-Agent': 'Bot/1.0'}
+    headers = {"Content-Type": "application/json"}
     if extra_headers:
         headers.update(extra_headers)
-    body = json.dumps(data).encode('utf-8')
+    body = json.dumps(data).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode('utf-8'))
-
-# ── Deduplication par similarite (Jaccard) ─────────────────────────────────
-def normalize(text):
-    t = text.lower()
-    t = re.sub(r'https?://\S+', '', t)
-    t = re.sub(r'[^\w\s]', '', t)
-    t = re.sub(r'\s+', ' ', t).strip()
-    return t
-
-def jaccard(a, b):
-    wa = set(normalize(a).split())
-    wb = set(normalize(b).split())
-    if not wa or not wb:
-        return 0.0
-    return len(wa & wb) / len(wa | wb)
-
-def is_duplicate(text):
-    for prev in seen_texts[-100:]:
-        if jaccard(text, prev) >= SIMILARITY_THR:
-            return True
-    return False
-
-def mark_seen(text):
-    global seen_texts
-    seen_texts.append(text)
-    if len(seen_texts) > 200:
-        seen_texts = seen_texts[-200:]
-
-# ── Score de pertinence ────────────────────────────────────────────────────
-def score_claude(text_fr):
-    """Score via Claude Haiku — rapide et pas cher."""
-    prompt = (
-        "Tu es un filtre d'actualites armeniennes. "
-        "Evalue la pertinence de ce texte traduit en francais.\n\n"
-        f'Texte : "{text_fr[:400]}"\n\n'
-        "Score de 1 a 10 :\n"
-        "8-10 : Important (politique, guerre, catastrophe, election, economie majeure)\n"
-        "5-7  : Interessant (societe, sport, culture, fait divers notable)\n"
-        "1-4  : Peu utile (pub, spam, voeux, texte trop court, contenu banal)\n\n"
-        'Reponds UNIQUEMENT en JSON : {"score": X, "raison": "..."}'
-    )
-    try:
-        result = http_post_json(
-            "https://api.anthropic.com/v1/messages",
-            {
-                'model': 'claude-haiku-4-5-20251001',
-                'max_tokens': 80,
-                'messages': [{'role': 'user', 'content': prompt}]
-            },
-            extra_headers={
-                'x-api-key': CLAUDE_API_KEY,
-                'anthropic-version': '2023-06-01',
-            }
-        )
-        raw = result['content'][0]['text'].strip()
-        raw = re.sub(r'```json|```', '', raw).strip()
-        parsed = json.loads(raw)
-        return int(parsed.get('score', 5)), parsed.get('raison', '')
-    except Exception as e:
-        log.warning(f'Score Claude echoue: {e}')
-        return None, None
-
-def score_basic(text):
-    """Score sans IA — mots-cles."""
-    t = text.lower()
-    score = 5
-    for w in ['mort', 'tue', 'guerre', 'attaque', 'explosion', 'election',
-              'president', 'accord', 'crise', 'urgence', 'arrestation',
-              'manifestation', 'tremblement', 'accident', 'incendie',
-              'assassinat', 'catastrophe', 'bombe', 'militaire', 'reforme']:
-        if w in t:
-            score = min(10, score + 2)
-    for w in ['promo', 'solde', 'publicite', 'abonnez', 'abonnement',
-              'bonne journee', 'bonjour', 'bonsoir', 'felicitations',
-              'anniversaire', 'souhaits', 'voeux', 'cliquez', 'suivez',
-              'instagram', 'facebook', 'youtube']:
-        if w in t:
-            score = max(1, score - 2)
-    if len(text.split()) < 5:
-        score = max(1, score - 2)
-    return score, f'Mots-cles : {score}/10'
-
-def get_score(text_fr):
-    if CLAUDE_API_KEY:
-        score, raison = score_claude(text_fr)
-        if score is not None:
-            return score, raison
-    return score_basic(text_fr)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
 
 # ── RSS ────────────────────────────────────────────────────────────────────
 RSSHUB_INSTANCES = [
-    'https://rsshub.rssforever.com',
-    'https://rss.shab.fun',
-    'https://rsshub.rss3.workers.dev',
-    'https://rsshub.app',
+    "https://rsshub.rssforever.com",
+    "https://rss.shab.fun",
+    "https://rsshub.rss3.workers.dev",
+    "https://rsshub.app",
 ]
 
 def strip_tags(html):
-    clean = re.sub(r'<[^>]+>', ' ', html)
-    return re.sub(r'\s+', ' ', clean).strip()
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
 
 def parse_rss(xml_text):
     items = []
     try:
         root = ET.fromstring(xml_text)
-        for item in root.findall('.//item'):
-            guid    = item.findtext('guid') or item.findtext('link') or ''
-            content = strip_tags(item.findtext('description') or '') or strip_tags(item.findtext('title') or '')
-            link    = item.findtext('link') or ''
-            pubdate = item.findtext('pubDate') or ''
+        for item in root.findall(".//item"):
+            guid    = item.findtext("guid") or item.findtext("link") or ""
+            content = strip_tags(item.findtext("description") or "") or strip_tags(item.findtext("title") or "")
+            link    = item.findtext("link") or ""
+            pubdate = item.findtext("pubDate") or ""
             if content.strip():
-                items.append({'guid': guid, 'content': content.strip(), 'link': link, 'pubDate': pubdate})
+                items.append({"guid": guid, "content": content.strip(), "link": link, "pubDate": pubdate})
     except ET.ParseError as e:
-        log.warning(f'Parsing RSS: {e}')
+        log.warning(f"Parsing RSS: {e}")
     return items
 
 def fetch_rss(channel):
     for base in RSSHUB_INSTANCES:
-        url = f'{base}/telegram/channel/{channel}'
+        url = f"{base}/telegram/channel/{channel}"
         try:
             text = http_get(url, timeout=12)
-            if '<item>' in text:
-                log.info(f'RSS OK @{channel} via {base}')
+            if "<item>" in text:
+                log.info(f"RSS OK @{channel} via {base}")
                 return parse_rss(text)
         except Exception as e:
-            log.debug(f'@{channel} {base}: {e}')
-    raise RuntimeError(f'Toutes les instances RSSHub ont echoue pour @{channel}')
+            log.debug(f"@{channel} {base}: {e}")
+    raise RuntimeError(f"Toutes les instances RSSHub ont echoue pour @{channel}")
 
-# ── Traduction MyMemory ─────────────────────────────────────────────────────
+# ── Traduction ─────────────────────────────────────────────────────────────
 def translate(text):
-    params = urllib.parse.urlencode({'q': text[:500], 'langpair': 'hy|fr'})
+    params = urllib.parse.urlencode({"q": text[:500], "langpair": "hy|fr"})
     if MYMEMORY_EMAIL:
-        params += '&de=' + urllib.parse.quote(MYMEMORY_EMAIL)
+        params += "&de=" + urllib.parse.quote(MYMEMORY_EMAIL)
     try:
-        resp = http_get(f'https://api.mymemory.translated.net/get?{params}', timeout=10)
+        resp = http_get(f"https://api.mymemory.translated.net/get?{params}", timeout=10)
         data = json.loads(resp)
-        if data.get('responseStatus') == 200:
-            return data['responseData']['translatedText']
+        if data.get("responseStatus") == 200:
+            return data["responseData"]["translatedText"]
     except Exception as e:
-        log.warning(f'Traduction: {e}')
+        log.warning(f"Traduction: {e}")
     return text
 
 # ── Telegram ───────────────────────────────────────────────────────────────
 def send_telegram(chat_id, text):
     result = http_post_json(
-        f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
-        {'chat_id': chat_id, 'text': text[:4000], 'parse_mode': 'HTML'}
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        {"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML"}
     )
-    if not result.get('ok'):
-        raise RuntimeError(result.get('description', 'Erreur'))
+    if not result.get("ok"):
+        raise RuntimeError(result.get("description", "Erreur"))
 
-def notify_all(channel, original, translated, score, raison):
-    emoji = '🔴' if score >= 8 else '🟡' if score >= 5 else '🟢'
+def notify_all(channel, original, translated):
     msg = (
-        f"<b>📢 @{channel}</b>  {emoji} <b>{score}/10</b>\n"
-        f"<i>{raison}</i>\n\n"
-        f"<i>🇦🇲 Original :</i>\n{original[:300]}\n\n"
-        f"<b>🇫🇷 Traduction :</b>\n{translated}"
+        f"<b>@{channel}</b>\n\n"
+        f"<i>Armenien :</i>\n{original[:300]}\n\n"
+        f"<b>Francais :</b>\n{translated}"
     )
     sent = 0
     for rid in recipient_ids:
         try:
             send_telegram(rid, msg)
             sent += 1
+            log.info(f"Notif envoyee -> {rid}")
             time.sleep(0.3)
         except Exception as e:
-            log.error(f'Notif -> {rid}: {e}')
-            stats['errors'] += 1
+            log.error(f"Notif -> {rid}: {e}")
+            stats["errors"] += 1
     return sent
 
-# ── Boucle principale ──────────────────────────────────────────────────────
+# ── Boucle ─────────────────────────────────────────────────────────────────
 def poll_channel(channel):
     try:
         items = fetch_rss(channel)
     except Exception as e:
-        log.error(f'@{channel}: {e}')
-        stats['errors'] += 1
+        log.error(f"@{channel}: {e}")
+        stats["errors"] += 1
         return
 
-    new_items = [i for i in items if i['guid'] not in seen_guids]
+    new_items = [i for i in items if i["guid"] not in seen_guids]
     for i in items:
-        seen_guids.add(i['guid'])
+        seen_guids.add(i["guid"])
 
     if first_run[channel]:
         first_run[channel] = False
-        for i in items:
-            mark_seen(i['content'])
-        log.info(f'@{channel} — {len(items)} msg(s) indexes (1er passage, pas de notif)')
+        log.info(f"@{channel} — {len(items)} msg(s) indexes (1er passage, pas de notif)")
         return
 
     if not new_items:
-        log.info(f'@{channel} — aucun nouveau message')
+        log.info(f"@{channel} — aucun nouveau message")
         return
 
-    log.info(f'@{channel} — {len(new_items)} nouveau(x) a analyser')
+    log.info(f"@{channel} — {len(new_items)} nouveau(x) message(s)")
 
     for item in new_items[:5]:
-        original = item['content']
-        stats['fetched'] += 1
+        original = item["content"]
+        stats["fetched"] += 1
 
-        # 1. Dedup similarite
-        if is_duplicate(original):
-            stats['skipped_dup'] += 1
-            log.info(f'[DOUBLON] "{original[:60]}"')
-            mark_seen(original)
-            continue
-
-        # 2. Traduction
         translated = translate(original)
         if translated != original:
-            stats['translated'] += 1
+            stats["translated"] += 1
+            log.info(f"Traduit: \"{translated[:60]}\"")
 
-        # 3. Score pertinence
-        score, raison = get_score(translated)
-        log.info(f'[SCORE {score}/10] {raison} — "{translated[:50]}..."')
-
-        # 4. Filtre
-        if score < MIN_SCORE:
-            stats['skipped_score'] += 1
-            log.info(f'[IGNORE] Score {score} < {MIN_SCORE}')
-            mark_seen(original)
-            continue
-
-        # 5. Envoi
-        mark_seen(original)
-        sent = notify_all(channel, original, translated, score, raison)
+        sent = notify_all(channel, original, translated)
         if sent > 0:
-            stats['sent'] += sent
+            stats["sent"] += sent
 
         time.sleep(1.5)
 
@@ -317,8 +190,6 @@ def print_stats():
         f"[STATS] Recus:{stats['fetched']} | "
         f"Traduits:{stats['translated']} | "
         f"Envoyes:{stats['sent']} | "
-        f"Doublons:{stats['skipped_dup']} | "
-        f"Score bas:{stats['skipped_score']} | "
         f"Erreurs:{stats['errors']}"
     )
 
@@ -331,12 +202,11 @@ def main():
             poll_channel(channel)
             time.sleep(1)
         print_stats()
-        # Mode GitHub Actions : un seul cycle puis on s'arrête
         if RUN_ONCE:
-            log.info("Mode cycle unique (GitHub Actions) — arret.")
+            log.info("Cycle unique termine (GitHub Actions).")
             break
         log.info(f"Prochain cycle dans {INTERVAL}s...")
         time.sleep(INTERVAL)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

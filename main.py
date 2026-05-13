@@ -30,6 +30,7 @@ CLAUDE_API_KEY  = os.environ.get('CLAUDE_API_KEY', '')   # optionnel — scoring
 INTERVAL        = int(os.environ.get('INTERVAL', '300'))
 MIN_SCORE       = int(os.environ.get('MIN_SCORE', '5'))          # score min /10
 SIMILARITY_THR  = float(os.environ.get('SIMILARITY_THR', '0.7')) # seuil doublon
+RUN_ONCE        = os.environ.get('RUN_ONCE', 'false').lower() == 'true'
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN manquant !")
@@ -339,4 +340,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    

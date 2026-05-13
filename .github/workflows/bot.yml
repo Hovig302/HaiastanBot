@@ -1,5 +1,4 @@
 name: Telegram Traducteur Bot
-
 on:
   schedule:
     - cron: '*/10 * * * *'

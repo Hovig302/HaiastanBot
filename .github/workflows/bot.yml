@@ -25,6 +25,5 @@ jobs:
           RECIPIENTS:     ${{ secrets.RECIPIENTS }}
           CHANNELS:       ${{ secrets.CHANNELS }}
           MYMEMORY_EMAIL: ${{ secrets.MYMEMORY_EMAIL }}
-          MIN_SCORE:      ${{ secrets.MIN_SCORE }}
           RUN_ONCE:       "true"
         run: python main.py

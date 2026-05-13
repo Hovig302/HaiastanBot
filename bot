@@ -1,0 +1,31 @@
+name: Telegram Traducteur Bot
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # Toutes les 5 minutes
+  workflow_dispatch:         # Lancement manuel possible
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4       # S'arrête avant le prochain cycle
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Lancer le bot (1 cycle)
+        env:
+          BOT_TOKEN:      ${{ secrets.BOT_TOKEN }}
+          RECIPIENTS:     ${{ secrets.RECIPIENTS }}
+          CHANNELS:       ${{ secrets.CHANNELS }}
+          MYMEMORY_EMAIL: ${{ secrets.MYMEMORY_EMAIL }}
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+          MIN_SCORE:      ${{ secrets.MIN_SCORE }}
+          RUN_ONCE:       "true"   # mode cycle unique pour GitHub Actions
+        run: python main.py
